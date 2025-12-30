@@ -2,46 +2,146 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import shutil
-from pathlib import Path
+import subprocess
+import sys
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_NAME = "OceansGuard"
 
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def die(msg: str) -> None:
-    raise SystemExit(f"[OceansGuard] {msg}")
+def info(msg: str) -> None:
+    print(f"[{PROJECT_NAME}] {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"[{PROJECT_NAME}][WARN] {msg}")
+
+
+def die(msg: str, code: int = 1) -> None:
+    raise SystemExit(f"[{PROJECT_NAME}] {msg}")
 
 
 def copy_if_missing(src: Path, dst: Path) -> None:
     if dst.exists():
-        print(f"[skip] exists: {dst}")
+        info(f"[skip] exists: {dst}")
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dst)
-    print(f"[create] {dst}")
+    info(f"[create] {dst}")
 
 
 def write_if_missing(dst: Path, content: str) -> None:
     if dst.exists():
-        print(f"[skip] exists: {dst}")
+        info(f"[skip] exists: {dst}")
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(content, encoding="utf-8")
-    print(f"[create] {dst}")
+    info(f"[create] {dst}")
 
 
-def cmd_init(repo: Path) -> None:
+def read_text_if_exists(p: Path) -> str | None:
+    if not p.exists():
+        return None
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def safe_json_load(p: Path) -> Any | None:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def try_import_yaml():
+    try:
+        import yaml  # type: ignore
+        return yaml
+    except Exception:
+        return None
+
+
+@dataclass(frozen=True)
+class GuardOutput:
+    pack: str = "ai_context_pack.md"
+    audit: str = "CHANGELOG_AI.md"
+    testlog: str = "ai_test_last.log"
+
+
+@dataclass(frozen=True)
+class GuardConfig:
+    raw: dict[str, Any]
+    output: GuardOutput
+
+    @staticmethod
+    def load(repo: Path) -> "GuardConfig":
+        """
+        優先順位:
+        1) repo/.aiguard.yml
+        2) templates/.aiguard.yml を init がコピー済みならそれ
+        3) templates/.aiguard.yml を repo にコピーしてから読む
+        4) 最終的に空設定（最低限で通す）
+        """
+        cfg_path = repo / ".aiguard.yml"
+        if not cfg_path.exists():
+            # まず templates が同リポ内にある前提（OceansGuard自身）
+            # 他PJで submodule 利用のケースでも templates が来る想定
+            tpl = repo / "templates" / ".aiguard.yml"
+            if tpl.exists():
+                copy_if_missing(tpl, cfg_path)
+
+        if not cfg_path.exists():
+            warn(".aiguard.yml not found. Running with minimal defaults.")
+            raw = {}
+            return GuardConfig(raw=raw, output=GuardOutput())
+
+        text = cfg_path.read_text(encoding="utf-8", errors="ignore")
+        yaml = try_import_yaml()
+        if yaml is None:
+            warn("PyYAML not installed. Some YAML features may not be parsed. "
+                 "Install: pip install pyyaml (CI already best-effort installs it).")
+            # 最低限: JSONとして読めるなら読む、無理なら空
+            raw = {}
+            return GuardConfig(raw=raw, output=GuardOutput())
+
+        try:
+            raw = yaml.safe_load(text) or {}
+        except Exception as e:
+            warn(f"Failed to parse .aiguard.yml: {e}")
+            raw = {}
+
+        out = raw.get("output") or {}
+        output = GuardOutput(
+            pack=str(out.get("pack", GuardOutput.pack)),
+            audit=str(out.get("audit", GuardOutput.audit)),
+            testlog=str(out.get("testlog", GuardOutput.testlog)),
+        )
+        return GuardConfig(raw=raw, output=output)
+
+
+def cmd_init(repo: Path) -> int:
     """
-    init は「コピー専用」。
+    init は「コピー専用」思想を維持。
     - templates/.aiguard.yml を .aiguard.yml にコピー（上書きしない）
     - ARCHITECTURE.md / SNAPSHOT.md を無ければ作成
     - contracts/ を無ければ作成
+    - contracts/openapi.json が無ければ placeholder を作成（上書きしない）
     """
     here = Path(__file__).resolve()
-    guard_root = here.parent.parent  # OceansGuard/
+    guard_root = here.parent.parent  # OceansGuard/（このリポのルート想定）
     templates = guard_root / "templates"
 
     tpl_aiguard = templates / ".aiguard.yml"
@@ -76,16 +176,222 @@ def cmd_init(repo: Path) -> None:
         (contracts / "README.md").write_text(
             "# Contracts\n\n"
             "このディレクトリには、守るべき契約を置きます。\n\n"
-            "- OpenAPI（FastAPI の openapi.yaml）\n"
+            "- OpenAPI（FastAPI の openapi.yaml / openapi.json）\n"
             "- DB schema snapshot\n"
             "- UI DTO / 型\n\n",
             encoding="utf-8",
         )
-        print(f"[create] {contracts}/README.md")
+        info(f"[create] {contracts}/README.md")
     else:
-        print(f"[skip] exists: {contracts}/")
+        info(f"[skip] exists: {contracts}/")
 
-    print("[OK] init completed")
+    # 4) contracts/openapi.json placeholder（空ファイル対策：ただし上書きしない）
+    openapi = contracts / "openapi.json"
+    if not openapi.exists():
+        openapi.write_text(
+            json.dumps(
+                {
+                    "openapi": "3.0.3",
+                    "info": {"title": f"{PROJECT_NAME} Placeholder API", "version": "0.0.0"},
+                    "paths": {},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        info(f"[create] {openapi}")
+    else:
+        info(f"[skip] exists: {openapi}")
+
+    info("[OK] init completed")
+    return 0
+
+
+def _ensure_guard_dir(repo: Path) -> Path:
+    d = repo / ".aiguard"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _collect_context_pack(repo: Path, cfg: GuardConfig) -> str:
+    """
+    templates/.aiguard.yml の context.small.include を中心に “軽量” にまとめる。
+    無い場合は、代表ファイルだけを対象にする。
+    """
+    raw = cfg.raw
+    includes: list[str] = []
+
+    ctx = raw.get("context") or {}
+    small = ctx.get("small") or {}
+    include = small.get("include")
+    if isinstance(include, list):
+        includes = [str(x) for x in include]
+    else:
+        includes = ["ARCHITECTURE.md", "SNAPSHOT.md", "README.md", "pyproject.toml", "package.json", "contracts/**"]
+
+    lines: list[str] = []
+    lines.append(f"# {PROJECT_NAME} Context Pack")
+    lines.append("")
+    lines.append(f"_generated @ {now_iso()}_")
+    lines.append("")
+
+    def add_file(path: Path) -> None:
+        rel = path.relative_to(repo)
+        text = read_text_if_exists(path)
+        if text is None:
+            return
+        # 過大防止：1ファイル最大 4000 文字
+        text = text[:4000]
+        lines.append(f"## {rel.as_posix()}")
+        lines.append("```")
+        lines.append(text.rstrip("\n"))
+        lines.append("```")
+        lines.append("")
+
+    for pat in includes:
+        if pat.endswith("/**") or pat.endswith("**"):
+            base = pat.replace("/**", "").replace("**", "").strip("/")
+            base_dir = repo / base
+            if base_dir.exists() and base_dir.is_dir():
+                for p in sorted(base_dir.rglob("*")):
+                    if p.is_file() and p.suffix.lower() in (".md", ".yml", ".yaml", ".json", ".toml", ".py", ".ts", ".tsx", ".js"):
+                        add_file(p)
+            continue
+
+        # glob対応
+        matched = list(repo.glob(pat))
+        if matched:
+            for p in matched:
+                if p.is_file():
+                    add_file(p)
+            continue
+
+        # 通常ファイル
+        p = repo / pat
+        if p.exists() and p.is_file():
+            add_file(p)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def cmd_pack(repo: Path) -> int:
+    """
+    pack:
+    - .aiguard/ai_context_pack.md を生成（output.pack に従う）
+    - .aiguard/pack.json に簡易メタを書き出し
+    - ここでは “止めない” 方針（構成生成が目的）
+    """
+    cfg = GuardConfig.load(repo)
+    guard_dir = _ensure_guard_dir(repo)
+
+    pack_md = _collect_context_pack(repo, cfg)
+    (repo / cfg.output.pack).write_text(pack_md, encoding="utf-8")
+    info(f"[write] {cfg.output.pack}")
+
+    meta = {
+        "project": PROJECT_NAME,
+        "generated_at": now_iso(),
+        "output": dataclass_to_dict(cfg.output),
+        "note": "pack generates context artifacts. It should be non-blocking.",
+    }
+    (guard_dir / "pack.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    info("[OK] pack completed")
+    return 0
+
+
+def _run_command(cmd: str, repo: Path) -> tuple[int, str]:
+    """
+    YAMLの checks.commands は shell 前提のものがあるため shell=True で実行。
+    """
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(repo),
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    out, _ = p.communicate()
+    return p.returncode or 0, out or ""
+
+
+def _load_checks_commands(cfg: GuardConfig) -> list[str]:
+    raw = cfg.raw
+    checks = raw.get("checks") or {}
+    commands = checks.get("commands")
+    if isinstance(commands, list):
+        return [str(x) for x in commands]
+    return []
+
+
+def cmd_check(repo: Path) -> int:
+    """
+    check:
+    - templates/.aiguard.yml にある checks.commands を順に実行
+    - 失敗があれば exit 1（＝PRを止める）
+    - ただし summarize は || true が付いている想定なので失敗しても継続
+    """
+    cfg = GuardConfig.load(repo)
+    guard_dir = _ensure_guard_dir(repo)
+
+    cmds = _load_checks_commands(cfg)
+    if not cmds:
+        warn("No checks.commands found in .aiguard.yml. Nothing to run.")
+        # 何も無いなら成功扱い（ガードレールとしては最小）
+        return 0
+
+    log_lines: list[str] = []
+    log_lines.append(f"[{PROJECT_NAME}] check started @ {now_iso()}")
+    log_lines.append("")
+
+    failed = False
+
+    for i, cmd in enumerate(cmds, start=1):
+        log_lines.append(f"---")
+        log_lines.append(f"[{i}/{len(cmds)}] $ {cmd}")
+        rc, out = _run_command(cmd, repo)
+        log_lines.append(out.rstrip("\n"))
+        log_lines.append(f"[exit] {rc}")
+        log_lines.append("")
+
+        # shellで '|| true' を付けているものは rc=0 になる想定
+        if rc != 0:
+            failed = True
+
+    testlog_path = repo / cfg.output.testlog
+    testlog_path.write_text("\n".join(log_lines).rstrip() + "\n", encoding="utf-8")
+    info(f"[write] {cfg.output.testlog}")
+
+    # 失敗ログは guard_dir にもコピーしておく（CIで参照しやすい）
+    (guard_dir / "ai_test_last.log").write_text(testlog_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    if failed:
+        die("check failed (one or more commands returned non-zero).", code=1)
+    info("[OK] check completed")
+    return 0
+
+
+def cmd_run(repo: Path, task: str) -> int:
+    """
+    将来拡張用。現時点では最低限として、
+    - task が空なら check を実行
+    - task が init/pack/check のいずれかならそのまま実行
+    """
+    if not task:
+        return cmd_check(repo)
+    if task == "init":
+        return cmd_init(repo)
+    if task == "pack":
+        return cmd_pack(repo)
+    if task == "check":
+        return cmd_check(repo)
+    warn(f"Unknown task: {task}. Running check instead.")
+    return cmd_check(repo)
+
+
+def dataclass_to_dict(obj: Any) -> dict[str, Any]:
+    return {k: getattr(obj, k) for k in obj.__dataclass_fields__.keys()}  # type: ignore[attr-defined]
 
 
 def main() -> None:
@@ -98,11 +404,15 @@ def main() -> None:
     repo = Path(args.repo).resolve()
 
     if args.command == "init":
-        cmd_init(repo)
-        return
+        raise SystemExit(cmd_init(repo))
+    if args.command == "pack":
+        raise SystemExit(cmd_pack(repo))
+    if args.command == "check":
+        raise SystemExit(cmd_check(repo))
+    if args.command == "run":
+        raise SystemExit(cmd_run(repo, args.task))
 
-    # pack / check / run は既存実装を使用
-    die("This build only finalizes init. Use previous implementation for pack/check/run.")
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+# .github/workflows/oceansguard.yml
 name: OceansGuard
 
 on:
@@ -34,10 +35,10 @@ jobs:
       # FastAPI / OpenAPI契約チェック用（未使用PJでも害なし）
       - name: Install Python tooling (best-effort)
         run: |
+          pip install pyyaml || true
           pip install uvicorn fastapi || true
           pip install ruff mypy pytest || true
 
-      # React がある場合に備えて：node_modules はnpm ci/build側で吸収
       - name: OceansGuard init (idempotent)
         run: |
           python core/aiguard.py init
