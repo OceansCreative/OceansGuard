@@ -1,0 +1,8 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "OceansGuard Placeholder API",
+    "version": "0.0.0"
+  },
+  "paths": {}
+}
