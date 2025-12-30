@@ -97,6 +97,16 @@ checks:
       d='frontend';
       sys.exit(0 if not os.path.isdir(d) else subprocess.call('npm run build --silent', cwd=d, shell=True))"
 
+    # （既存の Python / React checks の下に追加）
+    - >
+      python core/openapi_contract.py
+
+    - >
+      python -c "import os,sys;
+      sys.exit(0 if not os.path.exists('contracts/openapi.json') else
+      __import__('subprocess').call([sys.executable,'core/openapi_contract.py']))"
+
+
 output:
   pack: ai_context_pack.md
   audit: CHANGELOG_AI.md
