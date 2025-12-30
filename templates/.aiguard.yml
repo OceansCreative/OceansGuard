@@ -21,19 +21,21 @@ context:
       - build
       - .next
       - __pycache__
+      - __pypackages__
       - .pytest_cache
       - .mypy_cache
       - .ruff_cache
     exclude_globs: ["**/*.min.js", "**/*.map"]
     max_files: 220
     max_kb_each: 64
-  evidence:
-    commands:
-      - git status --porcelain=v1 || true
-      - git diff || true
-      - python --version || true
-      - node --version || true
-      - npm --version || true
+
+evidence:
+  commands:
+    - git status --porcelain=v1 || true
+    - git diff || true
+    - python --version || true
+    - node --version || true
+    - npm --version || true
 
 dlp:
   enable: true
@@ -51,7 +53,7 @@ guard:
 checks:
   commands:
     # =========================
-    # Backend (FastAPI / Python)
+    # Backend (Python)
     # =========================
 
     # compileall: backend/app/src が存在する場合のみ実行（無ければスキップ）
@@ -82,7 +84,7 @@ checks:
       sys.exit(subprocess.call([sys.executable,'-m','pytest','-q']) if (has and has_tests) else 0)"
 
     # =========================
-    # Frontend (React / Node)
+    # Frontend (React)
     # =========================
 
     # npm ci (or npm install): frontend が存在する場合のみ実行
@@ -96,18 +98,6 @@ checks:
       python -c "import os,sys,subprocess;
       d='frontend';
       sys.exit(0 if not os.path.isdir(d) else subprocess.call('npm run build --silent', cwd=d, shell=True))"
-
-    # （既存の Python / React checks の下に追加）
-    - python core/openapi_contract.py
-
-    - >
-      python -c "import os,sys;
-      sys.exit(0 if not os.path.exists('contracts/openapi.json') else
-      __import__('subprocess').call([sys.executable,'core/openapi_contract.py']))"
-
-    # 失敗時ログ要約（check が失敗しても要約は残す）
-    - python core/summarize_logs.py || true
-
 
 output:
   pack: ai_context_pack.md

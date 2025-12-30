@@ -31,21 +31,32 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      # FastAPI / OpenAPI契約チェック用（未使用PJでも害なし）
-      - name: Install Python tooling (best-effort)
+      - name: Install tooling (best-effort)
         run: |
-          pip install uvicorn fastapi || true
+          pip install pyyaml || true
           pip install ruff mypy pytest || true
+          pip install uvicorn fastapi || true
 
-      # React がある場合に備えて：node_modules はnpm ci/build側で吸収
+      - name: Resolve OceansGuard entry
+        id: og
+        run: |
+          if [ -f "tools/OceansGuard/core/aiguard.py" ]; then
+            echo "ENTRY=tools/OceansGuard/core/aiguard.py" >> $GITHUB_OUTPUT
+          elif [ -f "core/aiguard.py" ]; then
+            echo "ENTRY=core/aiguard.py" >> $GITHUB_OUTPUT
+          else
+            echo "OceansGuard entry not found" >&2
+            exit 1
+          fi
+
       - name: OceansGuard init (idempotent)
         run: |
-          python tools/OceansGuard/core/aiguard.py init
+          python "${{ steps.og.outputs.ENTRY }}" init --repo .
 
       - name: OceansGuard pack
         run: |
-          python tools/OceansGuard/core/aiguard.py pack
+          python "${{ steps.og.outputs.ENTRY }}" pack --repo .
 
       - name: OceansGuard check
         run: |
-          python tools/OceansGuard/core/aiguard.py check
+          python "${{ steps.og.outputs.ENTRY }}" check --repo .
