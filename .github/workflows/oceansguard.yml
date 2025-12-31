@@ -53,10 +53,14 @@ jobs:
         run: |
           python "${{ steps.og.outputs.ENTRY }}" init --repo .
 
-      - name: OceansGuard pack
+      - name: OceansGuard run (pack + check)
         run: |
+
           python "${{ steps.og.outputs.ENTRY }}" pack --repo .
 
       - name: OceansGuard check
         run: |
           python "${{ steps.og.outputs.ENTRY }}" check --repo .
+
+          python "${{ steps.og.outputs.ENTRY }}" run --repo . --task "CI guard" --strict
+

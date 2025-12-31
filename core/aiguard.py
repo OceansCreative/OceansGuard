@@ -4,19 +4,20 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import json
 import os
 import re
-import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
-# =========================
-# 基本ユーティリティ
-# =========================
+# ============================================================
+# Basic utilities
+# ============================================================
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -33,28 +34,66 @@ def die(msg: str, code: int = 1) -> None:
     raise SystemExit(f"[OceansGuard] {msg}")
 
 
-def run(cmd: List[str], cwd: Path, check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
+def guard_root() -> Path:
+    # core/aiguard.py -> OceansGuard/
+    return Path(__file__).resolve().parent.parent
+
+
+def run_argv(argv: List[str], cwd: Path, check: bool = False) -> subprocess.CompletedProcess:
+    """
+    subprocess.run wrapper (argv form).
+    stdout/stderr are decoded as UTF-8 best-effort.
+    """
+    cp = subprocess.run(
+        argv,
         cwd=str(cwd),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        capture_output=True,
         check=check,
         env=os.environ.copy(),
     )
 
+    def _decode(b: bytes) -> str:
+        if not b:
+            return ""
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            return b.decode("utf-8", errors="replace")
 
-def run_shell(cmd: str, cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    # monkeypatch for convenience (keeps compatibility with old code style)
+    cp.stdout = _decode(cp.stdout)  # type: ignore[attr-defined]
+    cp.stderr = _decode(cp.stderr)  # type: ignore[attr-defined]
+    return cp
+
+
+def run_shell(cmd: str, cwd: Path, check: bool = False) -> subprocess.CompletedProcess:
+    """
+    subprocess.run wrapper (shell form).
+    """
+    cp = subprocess.run(
         cmd,
         cwd=str(cwd),
-        text=True,
         shell=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        capture_output=True,
+        check=check,
         env=os.environ.copy(),
     )
+
+    def _decode(b: bytes) -> str:
+        if not b:
+            return ""
+        try:
+            return b.decode("utf-8")
+        except UnicodeDecodeError:
+            return b.decode("utf-8", errors="replace")
+
+    cp.stdout = _decode(cp.stdout)  # type: ignore[attr-defined]
+    cp.stderr = _decode(cp.stderr)  # type: ignore[attr-defined]
+    return cp
+
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def safe_read_text(p: Path, max_kb: int) -> str:
@@ -62,50 +101,35 @@ def safe_read_text(p: Path, max_kb: int) -> str:
         b = p.read_bytes()
     except Exception as e:
         return f"(failed to read: {e})\n"
+
     if len(b) > max_kb * 1024:
         return f"(skipped: too large {len(b)} bytes > {max_kb}KB)\n"
+
     try:
         return b.decode("utf-8", errors="replace")
     except Exception as e:
         return f"(failed to decode: {e})\n"
 
 
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+# ============================================================
+# Config / YAML
+# ============================================================
 
-
-def guard_root() -> Path:
-    # core/aiguard.py → OceansGuard/
-    return Path(__file__).resolve().parent.parent
-
-
-def ensure_pyyaml() -> None:
+def ensure_pyyaml(strict: bool) -> bool:
     """
-    ユーザー負担ゼロを優先して、PyYAML が無ければ best-effort で導入する。
-    CI でもローカルでも動く方針。
+    Returns True if PyYAML is available.
+    In strict mode, missing PyYAML is fatal.
     """
     try:
         import yaml  # noqa: F401
-        return
+        return True
     except Exception:
-        pass
-
-    warn("PyYAML not found. Trying to install pyyaml (best-effort).")
-    try:
-        # python -m pip install pyyaml
-        cp = run([os.environ.get("PYTHON", "python"), "-m", "pip", "install", "pyyaml"], cwd=Path.cwd())
-        if cp.returncode != 0:
-            warn(cp.stdout)
-            warn("Failed to install pyyaml. Some features may be skipped.")
-            return
-    except Exception as e:
-        warn(f"pip install pyyaml failed: {e}")
-        return
+        if strict:
+            die("PyYAML is required in --strict mode. Install: pip install pyyaml")
+        warn("PyYAML not found. Some config-driven features may be skipped.")
+        return False
 
 
-# =========================
-# 設定（.aiguard.yml）
-# =========================
 @dataclass
 class ContextSmall:
     include: List[str]
@@ -138,6 +162,7 @@ class Guard:
     max_files: int
     max_lines: int
     forbid_full_rewrite: bool
+    allow_full_rewrite_globs: List[str]
 
 
 @dataclass
@@ -150,6 +175,7 @@ class Output:
     pack: str
     audit: str
     testlog: str
+    report_json: str
 
 
 @dataclass
@@ -164,22 +190,30 @@ class Config:
     output: Output
 
 
-def _dict_get(d: dict, key: str, default):
+def _dict_get(d: Dict[str, Any], key: str, default: Any) -> Any:
     v = d.get(key, default)
     return default if v is None else v
 
 
-def load_config(repo: Path) -> Config:
-    ensure_pyyaml()
+def load_config(repo: Path, strict: bool) -> Config:
+    has_yaml = ensure_pyyaml(strict=strict)
     cfg_path = repo / ".aiguard.yml"
     if not cfg_path.exists():
-        die(".aiguard.yml not found. Run `python <OceansGuard>/core/aiguard.py init --repo <repo>` first.")
+        die(".aiguard.yml not found. Run `python core/aiguard.py init --repo <repo>` first.")
 
-    try:
-        import yaml  # type: ignore
-        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    except Exception as e:
-        die(f"Failed to parse .aiguard.yml: {e}")
+    raw: Dict[str, Any] = {}
+    if has_yaml:
+        try:
+            import yaml  # type: ignore
+            raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception as e:
+            if strict:
+                die(f"Failed to parse .aiguard.yml: {e}")
+            warn(f"Failed to parse .aiguard.yml; using minimal defaults. ({e})")
+            raw = {}
+    else:
+        if strict:
+            die("Cannot read .aiguard.yml without PyYAML in strict mode.")
 
     version = int(_dict_get(raw, "version", 1))
 
@@ -188,10 +222,19 @@ def load_config(repo: Path) -> Config:
     large = _dict_get(ctx, "large", {})
 
     context_small = ContextSmall(include=[str(x) for x in _dict_get(small, "include", [])])
+
+    # sane defaults
     context_large = ContextLarge(
-        roots=[str(x) for x in _dict_get(large, "roots", [])],
-        exclude_dirs=[str(x) for x in _dict_get(large, "exclude_dirs", [])],
-        exclude_globs=[str(x) for x in _dict_get(large, "exclude_globs", [])],
+        roots=[str(x) for x in _dict_get(large, "roots", ["backend", "app", "src", "frontend"])],
+        exclude_dirs=[str(x) for x in _dict_get(
+            large,
+            "exclude_dirs",
+            [
+                ".git", ".venv", "venv", "node_modules", "dist", "build", ".next",
+                "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            ],
+        )],
+        exclude_globs=[str(x) for x in _dict_get(large, "exclude_globs", ["**/*.min.js", "**/*.map"])],
         max_files=int(_dict_get(large, "max_files", 220)),
         max_kb_each=int(_dict_get(large, "max_kb_each", 64)),
     )
@@ -212,6 +255,7 @@ def load_config(repo: Path) -> Config:
         max_files=int(_dict_get(guard_raw, "max_files", 10)),
         max_lines=int(_dict_get(guard_raw, "max_lines", 400)),
         forbid_full_rewrite=bool(_dict_get(guard_raw, "forbid_full_rewrite", True)),
+        allow_full_rewrite_globs=[str(x) for x in _dict_get(guard_raw, "allow_full_rewrite_globs", [])],
     )
 
     checks_raw = _dict_get(raw, "checks", {})
@@ -222,6 +266,7 @@ def load_config(repo: Path) -> Config:
         pack=str(_dict_get(out_raw, "pack", "ai_context_pack.md")),
         audit=str(_dict_get(out_raw, "audit", "CHANGELOG_AI.md")),
         testlog=str(_dict_get(out_raw, "testlog", "ai_test_last.log")),
+        report_json=str(_dict_get(out_raw, "report_json", "ai_check_report.json")),
     )
 
     return Config(
@@ -236,9 +281,10 @@ def load_config(repo: Path) -> Config:
     )
 
 
-# =========================
-# init（コピー/雛形生成）
-# =========================
+# ============================================================
+# init
+# ============================================================
+
 def copy_if_missing(src: Path, dst: Path) -> None:
     if dst.exists():
         info(f"skip exists: {dst}")
@@ -291,7 +337,8 @@ def cmd_init(repo: Path) -> None:
         "- DB schema snapshot\n"
         "- DTO/型\n",
     )
-    # openapi.json は「空でもOK」運用にする（未導入PJでも害がない）
+
+    # openapi.json は「空でもOK」運用
     if not (contracts / "openapi.json").exists():
         (contracts / "openapi.json").write_text("", encoding="utf-8")
         info("create: contracts/openapi.json (empty)")
@@ -299,11 +346,12 @@ def cmd_init(repo: Path) -> None:
     info("init completed")
 
 
-# =========================
-# pack（AIに渡すコンテキスト束ね）
-# =========================
+# ============================================================
+# pack
+# ============================================================
+
 def glob_files(root: Path, pattern: str) -> List[Path]:
-    # ** を含む想定
+    # Path.glob supports ** when pattern contains it
     return [p for p in root.glob(pattern) if p.is_file()]
 
 
@@ -316,6 +364,35 @@ def should_exclude(path: Path, repo: Path, exclude_dirs: List[str], exclude_glob
         if fnmatch.fnmatch(rel, g):
             return True
     return False
+
+
+def collect_small(repo: Path, cfg: Config) -> List[Path]:
+    out: List[Path] = []
+    for pat in cfg.context_small.include:
+        out.extend(glob_files(repo, pat))
+
+    seen = set()
+    uniq: List[Path] = []
+    for p in sorted(out, key=lambda x: x.relative_to(repo).as_posix()):
+        rel = p.relative_to(repo).as_posix()
+        if rel in seen:
+            continue
+        seen.add(rel)
+        uniq.append(p)
+    return uniq
+
+
+def collect_changed_files(repo: Path) -> List[Path]:
+    cp = run_argv(["git", "diff", "--name-only"], cwd=repo)
+    files: List[Path] = []
+    for ln in (cp.stdout or "").splitlines():  # type: ignore[union-attr]
+        ln = ln.strip()
+        if not ln:
+            continue
+        p = repo / ln
+        if p.exists() and p.is_file():
+            files.append(p)
+    return files
 
 
 def collect_large(repo: Path, cfg: Config) -> List[Path]:
@@ -332,68 +409,50 @@ def collect_large(repo: Path, cfg: Config) -> List[Path]:
                 continue
             files.append(p)
 
-    # 安定順（相対パス）
     files = sorted(files, key=lambda x: x.relative_to(repo).as_posix())
-
-    # 上限
     if len(files) > cfg.context_large.max_files:
         files = files[: cfg.context_large.max_files]
     return files
 
 
-def collect_small(repo: Path, cfg: Config) -> List[Path]:
-    out: List[Path] = []
-    for pat in cfg.context_small.include:
-        for p in glob_files(repo, pat):
-            out.append(p)
-    # unique & stable
-    seen = set()
-    uniq: List[Path] = []
-    for p in sorted(out, key=lambda x: x.relative_to(repo).as_posix()):
-        rel = p.relative_to(repo).as_posix()
-        if rel in seen:
-            continue
-        seen.add(rel)
-        uniq.append(p)
-    return uniq
-
-
-def evidence_section(repo: Path, cfg: Config) -> str:
-    buf = []
-    buf.append("## Evidence\n")
-    for cmd in cfg.evidence.commands:
-        buf.append(f"\n### $ {cmd}\n")
-        cp = run_shell(cmd, cwd=repo)
-        buf.append("```text\n")
-        buf.append(cp.stdout or "")
-        buf.append("\n```\n")
-    return "".join(buf)
-
-
-def git_diff_section(repo: Path) -> str:
-    # CI/ローカルどちらも動く安全版
-    buf = []
+def pack_git_section(repo: Path) -> str:
+    buf: List[str] = []
     buf.append("## Git\n")
-    st = run(["git", "status", "--porcelain=v1"], cwd=repo)
+
+    st = run_argv(["git", "status", "--porcelain=v1"], cwd=repo)
     buf.append("\n### git status --porcelain=v1\n```text\n")
-    buf.append(st.stdout or "")
+    buf.append(st.stdout or "")  # type: ignore[arg-type]
     buf.append("\n```\n")
 
-    df = run(["git", "diff"], cwd=repo)
+    df = run_argv(["git", "diff"], cwd=repo)
+    diff_text = df.stdout or ""  # type: ignore[assignment]
     buf.append("\n### git diff\n```diff\n")
-    # diff が巨大化するとAIが壊れるので適度に切る
-    diff_text = df.stdout or ""
     if len(diff_text) > 200_000:
         buf.append(diff_text[:200_000])
         buf.append("\n... (truncated)\n")
     else:
         buf.append(diff_text)
     buf.append("\n```\n")
+
     return "".join(buf)
 
 
-def pack_files_section(repo: Path, files: List[Path], max_kb_each: int, title: str) -> str:
-    buf = []
+def evidence_section(repo: Path, cfg: Config) -> str:
+    buf: List[str] = []
+    if not cfg.evidence.commands:
+        return ""
+    buf.append("## Evidence\n")
+    for cmd in cfg.evidence.commands:
+        buf.append(f"\n### $ {cmd}\n")
+        cp = run_shell(cmd, cwd=repo)
+        buf.append("```text\n")
+        buf.append(cp.stdout or "")  # type: ignore[arg-type]
+        buf.append("\n```\n")
+    return "".join(buf)
+
+
+def pack_files(repo: Path, files: List[Path], max_kb_each: int, title: str) -> str:
+    buf: List[str] = []
     buf.append(f"## {title}\n")
     buf.append("\n### File list\n```text\n")
     for p in files:
@@ -409,57 +468,74 @@ def pack_files_section(repo: Path, files: List[Path], max_kb_each: int, title: s
     return "".join(buf)
 
 
-def cmd_pack(repo: Path) -> None:
-    cfg = load_config(repo)
+def cmd_pack(repo: Path, strict: bool) -> None:
+    cfg = load_config(repo, strict=strict)
     out_path = repo / cfg.output.pack
 
+    # diff-first
+    changed = [
+        p for p in collect_changed_files(repo)
+        if not should_exclude(p, repo, cfg.context_large.exclude_dirs, cfg.context_large.exclude_globs)
+    ]
     small_files = collect_small(repo, cfg)
     large_files = collect_large(repo, cfg)
 
-    buf = []
+    buf: List[str] = []
     buf.append("# OceansGuard Context Pack\n\n")
     buf.append(f"- generated_at: {now_iso()}\n")
     buf.append(f"- repo: {repo}\n")
     buf.append(f"- config_version: {cfg.version}\n")
-    buf.append(f"- note: This pack is intended for AI-assisted changes with guardrails.\n\n")
+    buf.append(f"- mode: {'strict' if strict else 'normal'}\n\n")
 
-    buf.append(git_diff_section(repo))
+    buf.append(pack_git_section(repo))
     buf.append(evidence_section(repo, cfg))
 
+    if changed:
+        buf.append(pack_files(repo, changed, max_kb_each=cfg.context_large.max_kb_each, title="Changed files (diff-first)"))
     if small_files:
-        buf.append(pack_files_section(repo, small_files, max_kb_each=cfg.context_large.max_kb_each, title="Context (small)"))
+        buf.append(pack_files(repo, small_files, max_kb_each=cfg.context_large.max_kb_each, title="Context (small)"))
     if large_files:
-        buf.append(pack_files_section(repo, large_files, max_kb_each=cfg.context_large.max_kb_each, title="Context (large, capped)"))
+        buf.append(pack_files(repo, large_files, max_kb_each=cfg.context_large.max_kb_each, title="Context (large, capped)"))
 
     out_path.write_text("".join(buf), encoding="utf-8")
     info(f"pack written: {out_path}")
 
 
-# =========================
-# Guard: 禁止系（全置換/危険diff）
-# =========================
-def detect_full_rewrite(repo: Path, cfg: Config) -> Optional[str]:
-    if not cfg.guard.forbid_full_rewrite:
+# ============================================================
+# Guard (full rewrite)
+# ============================================================
+
+def detect_full_rewrite(repo: Path, forbid: bool, allow_globs: List[str]) -> Optional[str]:
+    if not forbid:
         return None
 
-    # numstat: add del file
-    cp = run(["git", "diff", "--numstat"], cwd=repo)
-    lines = (cp.stdout or "").splitlines()
+    cp = run_argv(["git", "diff", "--numstat"], cwd=repo)
     suspicious: List[str] = []
-    for ln in lines:
+
+    def _allowed(path_str: str) -> bool:
+        s = path_str.replace("\\", "/")
+        for g in allow_globs or []:
+            if fnmatch.fnmatch(s, g):
+                return True
+        return False
+
+    for ln in (cp.stdout or "").splitlines():  # type: ignore[union-attr]
         parts = ln.split("\t")
         if len(parts) != 3:
             continue
         add_s, del_s, file_s = parts
         if add_s == "-" or del_s == "-":
             continue
+        if _allowed(file_s):
+            continue
+
         try:
             add_n = int(add_s)
             del_n = int(del_s)
         except ValueError:
             continue
 
-        # 目安：大きいファイルで add+del が巨大、かつ双方が大きい → 全置換の疑い
+        # heuristic: large add+del with both high -> possible rewrite
         if (add_n + del_n) >= 800 and add_n >= 300 and del_n >= 300:
             suspicious.append(f"{file_s} (add={add_n}, del={del_n})")
 
@@ -468,10 +544,11 @@ def detect_full_rewrite(repo: Path, cfg: Config) -> Optional[str]:
     return None
 
 
-# =========================
-# DLP（秘密情報・鍵・トークンの検知）
-# =========================
-SECRET_PATTERNS: List[Tuple[str, re.Pattern]] = [
+# ============================================================
+# DLP
+# ============================================================
+
+SECRET_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("PRIVATE_KEY", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
     ("AWS_ACCESS_KEY", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("GITHUB_TOKEN", re.compile(r"\bghp_[A-Za-z0-9]{36}\b")),
@@ -489,69 +566,70 @@ def is_allowlisted(rel_posix: str, allowlist: List[str]) -> bool:
 
 
 def mask_hit(text: str) -> str:
-    # 露出防止：sha256のみ残す
     return f"<masked:{sha256_text(text)[:12]}>"
 
 
-def scan_dlp(repo: Path, cfg: Config) -> List[str]:
-    if not cfg.dlp.enable:
+def scan_dlp(repo: Path, enable: bool, allowlist: List[str], mask: bool) -> List[str]:
+    if not enable:
         return []
 
-    # 変更されたファイル中心にしたいが、CIでも安全に動くよう「追跡対象のうちテキストだけ」軽く走査
-    # サイズ上限で暴走防止
     max_bytes = 256 * 1024  # 256KB
     hits: List[str] = []
 
-    cp = run(["git", "ls-files"], cwd=repo)
-    files = (cp.stdout or "").splitlines()
-    for rel in files:
-        rel_posix = rel.strip()
-        if not rel_posix:
+    cp = run_argv(["git", "ls-files"], cwd=repo)
+    for rel in (cp.stdout or "").splitlines():  # type: ignore[union-attr]
+        rel = rel.strip()
+        if not rel:
             continue
-        if is_allowlisted(rel_posix, cfg.dlp.allowlist_files):
+        if is_allowlisted(rel, allowlist):
             continue
-        p = repo / rel_posix
+
+        p = repo / rel
         if not p.exists() or not p.is_file():
             continue
+
         try:
             b = p.read_bytes()
         except Exception:
             continue
         if len(b) > max_bytes:
             continue
+
         s = b.decode("utf-8", errors="ignore")
         for name, pat in SECRET_PATTERNS:
             m = pat.search(s)
             if not m:
                 continue
             sample = m.group(0)
-            if cfg.dlp.mask:
+            if mask:
                 sample = mask_hit(sample)
-            hits.append(f"{name}: {rel_posix}: {sample}")
+            hits.append(f"{name}: {rel}: {sample}")
+
     return hits
 
 
-# =========================
-# OpenAPI 契約チェック（空ならスキップ）
-# =========================
-def openapi_contract_check(repo: Path) -> Optional[str]:
+# ============================================================
+# OpenAPI contract
+# ============================================================
+
+def openapi_contract_check(repo: Path, strict: bool) -> Optional[str]:
     p = repo / "contracts" / "openapi.json"
     if not p.exists():
-        return None
-    txt = p.read_text(encoding="utf-8", errors="ignore").strip()
-    if not txt:
-        # 空は「未導入」扱いでスキップ（あなたの要件）
+        if strict:
+            return "contracts/openapi.json is required in strict mode (can be empty only in normal mode)"
         return None
 
-    # 形式妥当性だけ最小チェック（JSON）
-    import json
+    txt = p.read_text(encoding="utf-8", errors="ignore").strip()
+    if not txt:
+        if strict:
+            return "contracts/openapi.json is empty in strict mode"
+        return None
 
     try:
         obj = json.loads(txt)
     except Exception as e:
         return f"contracts/openapi.json is not valid JSON: {e}"
 
-    # openapi/version の最低限
     if not isinstance(obj, dict):
         return "contracts/openapi.json must be a JSON object"
     if "openapi" not in obj and "swagger" not in obj:
@@ -559,29 +637,50 @@ def openapi_contract_check(repo: Path) -> Optional[str]:
     return None
 
 
-# =========================
-# check（コマンド実行 + ガード + DLP + 契約）
-# =========================
-def cmd_check(repo: Path) -> None:
-    cfg = load_config(repo)
+# ============================================================
+# check
+# ============================================================
 
-    # 1) full rewrite ガード
-    fr = detect_full_rewrite(repo, cfg)
+def cmd_check(repo: Path, strict: bool) -> None:
+    cfg = load_config(repo, strict=strict)
+
+    report: Dict[str, Any] = {
+        "tool": "OceansGuard",
+        "generated_at": now_iso(),
+        "repo": str(repo),
+        "mode": "strict" if strict else "normal",
+        "checks": [],
+        "dlp_hits": [],
+        "guard": {"full_rewrite": None},
+        "openapi_contract": None,
+        "status": "pass",
+    }
+
+    # 1) full rewrite guard
+    fr = detect_full_rewrite(repo, forbid=cfg.guard.forbid_full_rewrite, allow_globs=cfg.guard.allow_full_rewrite_globs)
     if fr:
+        report["guard"]["full_rewrite"] = fr
+        report["status"] = "fail"
+        (repo / cfg.output.report_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         die(fr)
 
     # 2) DLP
-    dlp_hits = scan_dlp(repo, cfg)
+    dlp_hits = scan_dlp(repo, enable=cfg.dlp.enable, allowlist=cfg.dlp.allowlist_files, mask=cfg.dlp.mask)
+    report["dlp_hits"] = dlp_hits
     if dlp_hits and cfg.dlp.block_on_detect:
-        msg = "DLP detected potential secrets:\n" + "\n".join(f"- {h}" for h in dlp_hits)
-        die(msg)
+        report["status"] = "fail"
+        (repo / cfg.output.report_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        die("DLP detected potential secrets:\n" + "\n".join(f"- {h}" for h in dlp_hits))
 
     # 3) OpenAPI contract
-    oc = openapi_contract_check(repo)
+    oc = openapi_contract_check(repo, strict=strict)
+    report["openapi_contract"] = oc
     if oc:
+        report["status"] = "fail"
+        (repo / cfg.output.report_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         die(oc)
 
-    # 4) checks.commands を順に実行
+    # 4) checks.commands
     log_path = repo / cfg.output.testlog
     logs: List[str] = []
     logs.append(f"[OceansGuard] check started @ {now_iso()}\n")
@@ -594,46 +693,56 @@ def cmd_check(repo: Path) -> None:
         info(f"check[{i}] {cmd}")
         cp = run_shell(cmd, cwd=repo)
         logs.append(f"\n=== check[{i}] {cmd} ===\n")
-        logs.append(cp.stdout or "")
+        logs.append(cp.stdout or "")  # type: ignore[arg-type]
         logs.append(f"\n[exit_code] {cp.returncode}\n")
+        report["checks"].append({"index": i, "command": cmd, "exit_code": cp.returncode})
         if cp.returncode != 0:
             failed.append((cmd, cp.returncode))
 
-    # 常にログを残す（あなたのストレス軽減）
+    # always write logs
     log_path.write_text("".join(logs), encoding="utf-8")
     info(f"testlog written: {log_path}")
 
+    # strict: checks.commands must exist
+    if strict and not [c for c in cfg.checks.commands if (c or "").strip()]:
+        report["status"] = "fail"
+        (repo / cfg.output.report_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        die("checks.commands is empty in strict mode")
+
     if failed:
+        report["status"] = "fail"
+        (repo / cfg.output.report_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         summary = "\n".join([f"- ({rc}) {cmd}" for cmd, rc in failed])
         die("check failed:\n" + summary)
 
+    (repo / cfg.output.report_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    info(f"report written: {repo / cfg.output.report_json}")
     info("check passed")
 
 
-# =========================
-# run（AI作業の“型”を固定：pack→(作業)→check）
-# =========================
-def cmd_run(repo: Path, task: str) -> None:
-    """
-    run は「あなたの作業ストレスを下げる」ための導線。
-    - まず pack を作ってAIに渡す材料を確定
-    - task はログに残す（作業目的の固定）
-    - 最後に check で締める
-    """
-    if not task.strip():
-        warn("run: --task is empty (still runs pack/check)")
-    else:
+# ============================================================
+# run
+# ============================================================
+
+def cmd_run(repo: Path, task: str, strict: bool) -> None:
+    if task.strip():
         info(f"run task: {task}")
+    else:
+        warn("run: --task is empty (still runs pack/check)")
+    cmd_pack(repo, strict=strict)
+    cmd_check(repo, strict=strict)
 
-    cmd_pack(repo)
-    cmd_check(repo)
 
+# ============================================================
+# CLI
+# ============================================================
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="aiguard")
     ap.add_argument("command", choices=["init", "pack", "check", "run"])
     ap.add_argument("--repo", default=".")
     ap.add_argument("--task", default="")
+    ap.add_argument("--strict", action="store_true", help="Do not allow skipping; fail if prerequisites missing.")
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
@@ -642,13 +751,13 @@ def main() -> None:
         cmd_init(repo)
         return
     if args.command == "pack":
-        cmd_pack(repo)
+        cmd_pack(repo, strict=args.strict)
         return
     if args.command == "check":
-        cmd_check(repo)
+        cmd_check(repo, strict=args.strict)
         return
     if args.command == "run":
-        cmd_run(repo, task=args.task)
+        cmd_run(repo, task=args.task, strict=args.strict)
         return
 
     die("unknown command")

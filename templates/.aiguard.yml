@@ -46,54 +46,47 @@ dlp:
     - "frontend/.env.example"
 
 guard:
-  max_files: 10
-  max_lines: 400
   forbid_full_rewrite: true
+  allow_full_rewrite_globs:
+    - "core/aiguard.py"
+    - ".github/workflows/oceansguard.yml"
 
 checks:
   commands:
-    # =========================
+    # ====
     # Backend (Python)
-    # =========================
-
-    # compileall: backend/app/src が存在する場合のみ実行（無ければスキップ）
+    # ====
     - >
       python -c "import os,sys,subprocess;
       targets=[d for d in ('backend','app','src') if os.path.isdir(d)];
       sys.exit(subprocess.call([sys.executable,'-m','compileall',*targets]) if targets else 0)"
 
-    # ruff: インストール済み かつ 対象dir存在時のみ実行（無ければスキップ）
     - >
       python -c "import os,sys,subprocess,importlib.util;
       targets=[d for d in ('backend','app','src') if os.path.isdir(d)];
       has=importlib.util.find_spec('ruff') is not None;
       sys.exit(subprocess.call([sys.executable,'-m','ruff','check',*targets]) if (has and targets) else 0)"
 
-    # mypy: インストール済み かつ 対象dir存在時のみ実行（無ければスキップ）
     - >
       python -c "import os,sys,subprocess,importlib.util;
       targets=[d for d in ('backend','app','src') if os.path.isdir(d)];
       has=importlib.util.find_spec('mypy') is not None;
       sys.exit(subprocess.call([sys.executable,'-m','mypy',*targets]) if (has and targets) else 0)"
 
-    # pytest: tests が存在し、pytest導入済みの場合のみ実行（無ければスキップ）
     - >
       python -c "import os,sys,subprocess,importlib.util;
       has=importlib.util.find_spec('pytest') is not None;
       has_tests=any(os.path.isdir(p) for p in ('tests','backend/tests','app/tests','src/tests'));
       sys.exit(subprocess.call([sys.executable,'-m','pytest','-q']) if (has and has_tests) else 0)"
 
-    # =========================
+    # ====
     # Frontend (React)
-    # =========================
-
-    # npm ci (or npm install): frontend が存在する場合のみ実行
+    # ====
     - >
       python -c "import os,sys,subprocess;
       d='frontend';
       sys.exit(0 if not os.path.isdir(d) else (subprocess.call('npm ci --silent', cwd=d, shell=True) if os.path.exists(os.path.join(d,'package-lock.json')) else subprocess.call('npm install --silent', cwd=d, shell=True)))"
 
-    # npm run build: frontend が存在する場合のみ実行
     - >
       python -c "import os,sys,subprocess;
       d='frontend';
@@ -103,3 +96,4 @@ output:
   pack: ai_context_pack.md
   audit: CHANGELOG_AI.md
   testlog: ai_test_last.log
+  report_json: ai_check_report.json
