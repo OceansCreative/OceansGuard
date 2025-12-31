@@ -21,13 +21,25 @@ context:
       - build
       - .next
       - __pycache__
+
+
       - __pypackages__
+
       - .pytest_cache
       - .mypy_cache
       - .ruff_cache
     exclude_globs: ["**/*.min.js", "**/*.map"]
     max_files: 220
     max_kb_each: 64
+
+  evidence:
+    commands:
+      - git status --porcelain=v1 || true
+      - git diff || true
+      - python --version || true
+      - node --version || true
+      - npm --version || true
+
 
 evidence:
   commands:
@@ -36,6 +48,7 @@ evidence:
     - python --version || true
     - node --version || true
     - npm --version || true
+
 
 dlp:
   enable: true
@@ -46,20 +59,38 @@ dlp:
     - "frontend/.env.example"
 
 guard:
+
+  max_files: 10
+  max_lines: 400
+  forbid_full_rewrite: true
+
   forbid_full_rewrite: true
   allow_full_rewrite_globs:
     - "core/aiguard.py"
     - ".github/workflows/oceansguard.yml"
 
+
+
 checks:
   commands:
     # ====
+
+    # Backend (FastAPI / Python)
+    # ====
+
+    # compileall: backend/app/src が存在する場合のみ実行（無ければスキップ）
+
     # Backend (Python)
     # ====
+
     - >
       python -c "import os,sys,subprocess;
       targets=[d for d in ('backend','app','src') if os.path.isdir(d)];
       sys.exit(subprocess.call([sys.executable,'-m','compileall',*targets]) if targets else 0)"
+
+
+    # ruff: インストール済み かつ 対象dir存在時のみ実行（無ければスキップ）
+
 
     - >
       python -c "import os,sys,subprocess,importlib.util;
@@ -67,11 +98,19 @@ checks:
       has=importlib.util.find_spec('ruff') is not None;
       sys.exit(subprocess.call([sys.executable,'-m','ruff','check',*targets]) if (has and targets) else 0)"
 
+
+    # mypy: インストール済み かつ 対象dir存在時のみ実行（無ければスキップ）
+
+
     - >
       python -c "import os,sys,subprocess,importlib.util;
       targets=[d for d in ('backend','app','src') if os.path.isdir(d)];
       has=importlib.util.find_spec('mypy') is not None;
       sys.exit(subprocess.call([sys.executable,'-m','mypy',*targets]) if (has and targets) else 0)"
+
+
+    # pytest: tests が存在し、pytest導入済みの場合のみ実行（無ければスキップ）
+
 
     - >
       python -c "import os,sys,subprocess,importlib.util;
@@ -80,20 +119,49 @@ checks:
       sys.exit(subprocess.call([sys.executable,'-m','pytest','-q']) if (has and has_tests) else 0)"
 
     # ====
+
+    # Frontend (React / Node)
+    # ====
+
+    # npm ci (or npm install): frontend が存在する場合のみ実行
+
     # Frontend (React)
     # ====
+
     - >
       python -c "import os,sys,subprocess;
       d='frontend';
       sys.exit(0 if not os.path.isdir(d) else (subprocess.call('npm ci --silent', cwd=d, shell=True) if os.path.exists(os.path.join(d,'package-lock.json')) else subprocess.call('npm install --silent', cwd=d, shell=True)))"
+
+
+    # npm run build: frontend が存在する場合のみ実行
+
 
     - >
       python -c "import os,sys,subprocess;
       d='frontend';
       sys.exit(0 if not os.path.isdir(d) else subprocess.call('npm run build --silent', cwd=d, shell=True))"
 
+
+    # （既存の Python / React checks の下に追加）
+    - python core/openapi_contract.py
+
+    - >
+      python -c "import os,sys;
+      sys.exit(0 if not os.path.exists('contracts/openapi.json') else
+      __import__('subprocess').call([sys.executable,'core/openapi_contract.py']))"
+
+    # 失敗時ログ要約（check が失敗しても要約は残す）
+    - python core/summarize_logs.py || true
+
+
+
+
 output:
   pack: ai_context_pack.md
   audit: CHANGELOG_AI.md
   testlog: ai_test_last.log
+
+
   report_json: ai_check_report.json
+
