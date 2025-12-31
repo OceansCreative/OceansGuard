@@ -1,54 +1,61 @@
+# README.md
 # OceansGuard
 
-OceansGuard は、生成AIによるコード変更を  
-**CI・契約・セキュリティで機械的に裁くためのガードレール**です。
+AI-assisted development guardrails for any repository.
 
-## 目的
-- AIにコードを書かせても事故らせない
-- 人が説明・確認・判断しなくてよい開発
-- どの言語・フレームワークでも共通運用
+## What it solves
+- AI-generated changes that accidentally drop existing code
+- Lack of global context (only partial files shown)
+- Forgetfulness / inconsistent constraints across sessions
+- No test / lint guarantees
+- Secret leakage (keys/tokens) into commits
+- Risky full-rewrite changes
 
-## 基本思想
-- AIは「提案者」
-- 正しさは「テスト・契約・ポリシー」が決める
-- 通らない変更は採用されない
+## Core commands
 
-## 使い方（各プロジェクト側）
-```bash
-python path/to/aiguard.py init
-python path/to/aiguard.py pack
-python path/to/aiguard.py check
+### init
+Create minimal guard files in target repo (idempotent; no overwrite).
 
-対応フェーズ
+python core/aiguard.py init --repo .
 
-開発前 / 開発途中 / 開発後 すべて対応
+### pack
+Generate AI context pack (diff-first).
+```
+python core/aiguard.py pack --repo .
+```
+### check
+Run guard checks + configured project checks and write reports.
+```
+python core/aiguard.py check --repo .
+```
+### run
+Shortcut = pack + check.
+```
+python core/aiguard.py run --repo . --task "your task"
+```
+## Strict mode
+--strict makes guardrails non-negotiable:
+- requires PyYAML
+- fails if checks.commands is empty
+- fails if contracts/openapi.json is missing/empty
+```
+python core/aiguard.py run --repo . --task "CI guard" --strict
+```
 
+## Submodule usage (recommended)
+In your target repository:
+```
+git submodule add https://github.com/OceansCreative/OceansGuard.git tools/OceansGuard
+python tools/OceansGuard/core/aiguard.py init --repo .
+python tools/OceansGuard/core/aiguard.py run --repo . --task "初回ガード適用"
+```
+## Outputs
+- ai_context_pack.md: single file to paste into AI chat
+- ai_test_last.log: raw execution logs
+- ai_check_report.json: structured result for CI/PR gating
 
----
-
-## ③ あなたの「不可がほぼ無い」運用フロー（確定）
-**どの案件でもこれだけ**
-
-
-
-AIに投げる前 → ai:pack
-AI差分適用後 → ai:check
-通ったら → 採用
-
-
-- 考えない
-- 説明しない
-- レビューしない  
-
----
-
-## ④ 最初のGit操作（推奨）
-```bash
-git add .
-git commit -m "feat: initial OceansGuard core structure"
-git tag v0.1.0
-git push origin main --tags
-
-
-
-## Create by OceansCreative
+## Git hooks (prevent committing to main)
+Install with:
+```
+python core/install_hooks.py --repo .
+```

@@ -1,0 +1,44 @@
+{
+  "tool": "OceansGuard",
+  "generated_at": "2025-12-31T10:57:48",
+  "repo": "C:\\Users\\kazus\\OneDrive\\ドキュメント\\GitHub\\OceansGuard",
+  "mode": "normal",
+  "checks": [
+    {
+      "index": 1,
+      "command": "python -c \"import os,sys,subprocess; targets=[d for d in ('backend','app','src') if os.path.isdir(d)]; sys.exit(subprocess.call([sys.executable,'-m','compileall',*targets]) if targets else 0)\"",
+      "exit_code": 0
+    },
+    {
+      "index": 2,
+      "command": "python -c \"import os,sys,subprocess,importlib.util; targets=[d for d in ('backend','app','src') if os.path.isdir(d)]; has=importlib.util.find_spec('ruff') is not None; sys.exit(subprocess.call([sys.executable,'-m','ruff','check',*targets]) if (has and targets) else 0)\"",
+      "exit_code": 0
+    },
+    {
+      "index": 3,
+      "command": "python -c \"import os,sys,subprocess,importlib.util; targets=[d for d in ('backend','app','src') if os.path.isdir(d)]; has=importlib.util.find_spec('mypy') is not None; sys.exit(subprocess.call([sys.executable,'-m','mypy',*targets]) if (has and targets) else 0)\"",
+      "exit_code": 0
+    },
+    {
+      "index": 4,
+      "command": "python -c \"import os,sys,subprocess,importlib.util; has=importlib.util.find_spec('pytest') is not None; has_tests=any(os.path.isdir(p) for p in ('tests','backend/tests','app/tests','src/tests')); sys.exit(subprocess.call([sys.executable,'-m','pytest','-q']) if (has and has_tests) else 0)\"",
+      "exit_code": 0
+    },
+    {
+      "index": 5,
+      "command": "python -c \"import os,sys,subprocess; d='frontend'; sys.exit(0 if not os.path.isdir(d) else (subprocess.call('npm ci --silent', cwd=d, shell=True) if os.path.exists(os.path.join(d,'package-lock.json')) else subprocess.call('npm install --silent', cwd=d, shell=True)))\"",
+      "exit_code": 0
+    },
+    {
+      "index": 6,
+      "command": "python -c \"import os,sys,subprocess; d='frontend'; sys.exit(0 if not os.path.isdir(d) else subprocess.call('npm run build --silent', cwd=d, shell=True))\"",
+      "exit_code": 0
+    }
+  ],
+  "dlp_hits": [],
+  "guard": {
+    "full_rewrite": null
+  },
+  "openapi_contract": null,
+  "status": "pass"
+}
